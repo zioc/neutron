@@ -23,6 +23,8 @@
 
 import inspect
 import os
+import ovs
+
 
 from quantum.agent.linux import utils as linux_utils
 from quantum.common import utils

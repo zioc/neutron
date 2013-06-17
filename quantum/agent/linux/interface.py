@@ -126,7 +126,7 @@ class NullDriver(LinuxInterfaceDriver):
 class OVSInterfaceDriver(LinuxInterfaceDriver):
     """Driver for creating an internal interface on an OVS bridge."""
 
-    DEV_NAME_PREFIX = 'tap'
+    DEV_NAME_PREFIX = 'qi'
 
     def __init__(self, conf):
         super(OVSInterfaceDriver, self).__init__(conf)

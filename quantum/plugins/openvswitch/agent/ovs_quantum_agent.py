@@ -23,6 +23,9 @@
 # @author: Kyle Mestery, Cisco Systems, Inc.
 
 import distutils.version as dist_version
+import os
+import pyudev
+import socket
 import sys
 import time
 
@@ -169,6 +172,7 @@ class OVSQuantumAgent(sg_rpc.SecurityGroupAgentRpcCallbackMixin):
         self.local_vlan_map = {}
 
         self.polling_interval = polling_interval
+        self.port_info = {}
 
         if tunnel_type in constants.TUNNEL_NETWORK_TYPES:
             self.enable_tunneling = True
@@ -191,7 +195,7 @@ class OVSQuantumAgent(sg_rpc.SecurityGroupAgentRpcCallbackMixin):
             'start_flag': True}
         self.setup_rpc()
 
-        # Security group agent supprot
+        # Security group agent support
         self.sg_agent = OVSSecurityGroupAgent(self.context,
                                               self.plugin_rpc,
                                               root_helper)
@@ -204,8 +208,7 @@ class OVSQuantumAgent(sg_rpc.SecurityGroupAgentRpcCallbackMixin):
     def _report_state(self):
         try:
             # How many devices are likely used by a VM
-            ports = self.int_br.get_vif_port_set()
-            num_devices = len(ports)
+            num_devices = len(self.port_info['current'])
             self.agent_state.get('configurations')['devices'] = num_devices
             self.state_rpc.report_state(self.context,
                                         self.agent_state)
@@ -604,16 +607,6 @@ class OVSQuantumAgent(sg_rpc.SecurityGroupAgentRpcCallbackMixin):
             int_veth.link.set_up()
             phys_veth.link.set_up()
 
-    def update_ports(self, registered_ports):
-        ports = self.int_br.get_vif_port_set()
-        if ports == registered_ports:
-            return
-        added = ports - registered_ports
-        removed = registered_ports - ports
-        return {'current': ports,
-                'added': added,
-                'removed': removed}
-
     def treat_vif_port(self, vif_port, port_id, network_id, network_type,
                        physical_network, segmentation_id, admin_state_up):
         if vif_port:
@@ -678,18 +671,24 @@ class OVSQuantumAgent(sg_rpc.SecurityGroupAgentRpcCallbackMixin):
                 self.port_unbound(device)
         return resync
 
-    def process_network_ports(self, port_info):
+    def process_network_ports(self):
+        LOG.debug(_('process_network_ports: PORT_INFO: %s'), self.port_info)
         resync_a = False
         resync_b = False
-        if 'added' in port_info:
-            resync_a = self.treat_devices_added(port_info['added'])
-        if 'removed' in port_info:
-            resync_b = self.treat_devices_removed(port_info['removed'])
-        # If one of the above opertaions fails => resync with plugin
-        return (resync_a | resync_b)
+        if 'add' in self.port_info:
+            resync_a = self.treat_devices_added(self.port_info['add'])
+            if not resync_a:
+                del self.port_info['add']
+        if 'remove' in self.port_info:
+            resync_b = self.treat_devices_removed(self.port_info['remove'])
+            if not resync_b:
+                del self.port_info['remove']
+        # If above operations succeed, no need to resync with plugin
+        if self.process_port_loop and not (resync_a | resync_b):
+            LOG.debug(_('STOP_PROCESS_NET_PORTS'))
+            self.process_port_loop.stop()
 
     def tunnel_sync(self):
-        resync = False
         try:
             details = self.plugin_rpc.tunnel_sync(self.context, self.local_ip)
             tunnels = details['tunnels']
@@ -702,53 +701,64 @@ class OVSQuantumAgent(sg_rpc.SecurityGroupAgentRpcCallbackMixin):
         except Exception as e:
             LOG.debug(_("Unable to sync tunnel IP %(local_ip)s: %(e)s"),
                       {'local_ip': self.local_ip, 'e': e})
-            resync = True
-        return resync
+            return
+        if self.tunnel_resync:
+            self.tunnel_resync.stop()
 
-    def rpc_loop(self):
-        sync = True
-        ports = set()
-        tunnel_sync = True
+    def udev_loop(self):
+        self.port_info['current'] = self.int_br.get_vif_port_set()
+        #Initialize looping call used to retrieve device details
+        self.process_port_loop = None
+        self.process_port_loop = loopingcall.FixedIntervalLoopingCall(
+            self.process_network_ports)
+        self.process_port_loop.start(self.polling_interval)
 
+        if self.enable_tunneling:
+            #Initialize looping call to sync tunnel endpoints
+            self.tunnel_resync = None
+            self.tunnel_resync = loopingcall.FixedIntervalLoopingCall(
+                self.tunnel_sync)
+            self.tunnel_resync.start(interval=self.polling_interval)
+
+        #Start pyudev monitor
+        udev = pyudev.Context()
+        monitor = pyudev.Monitor.from_netlink(udev)
+        monitor.filter_by('net')
+        monitor.start()
+
+        # Start an endless iterator monitoring udev events
         while True:
-            try:
-                start = time.time()
-                if sync:
-                    LOG.info(_("Agent out of sync with plugin!"))
-                    ports.clear()
-                    sync = False
+            for device in iter(monitor.poll, None):
+                LOG.debug(_('Udev notified the following change: '
+                          '%(action)s %(device)s")'),
+                          {'device': device.sys_name, 'action': device.action})
+                if device.action in ('add', 'remove') and (
+                        device.sys_name.startswith(('qr', 'qi', 'qvo'))):
+                    eventlet.sleep(1)
+                    port_id = self.int_br.get_vif_port_id(device.sys_name)
+                    if port_id:
+                        self.port_info[device.action].add(port_id)
+                        self.self.process_port_loop.start(self.polling_interval)
+        """
+        Device names comes from lot of places... the issue is that when
+        port comes up, it isn't yet plugged to ovs, as a result, we won't
+        be able to retrieve the port id immediately.
 
-                # Notify the plugin of tunnel IP
-                if self.enable_tunneling and tunnel_sync:
-                    LOG.info(_("Agent tunnel out of sync with plugin!"))
-                    tunnel_sync = self.tunnel_sync()
+        quantum.agent.l3_agent.INTERNAL_DEV_PREFIX = 'qr-'
+        quantum.agent.linux.interface.OVSInterfaceDriver = 'qi'
+        nova.virt.libvirt.vif.LibvirtGenericVIFDriver.get_veth_pair_names='qvo'
 
-                port_info = self.update_ports(ports)
+        -Use this optimistic (and non-deteminist) sleep
+        -We can rely on interface name to retrive the port id as in linuxbridge
+        -Rely on well defined interfaces prefixes, to make sure the port is
+        going to be plugged in the bridge
+        -Use udev version XXX to get notification about status changes and 
+        assume port status is changed to up after being plugged in OVS
+        """
 
-                # notify plugin about port deltas
-                if port_info:
-                    LOG.debug(_("Agent loop has new devices!"))
-                    # If treat devices fails - must resync with plugin
-                    sync = self.process_network_ports(port_info)
-                    ports = port_info['current']
-
-            except Exception:
-                LOG.exception(_("Error in agent event loop"))
-                sync = True
-                tunnel_sync = True
-
-            # sleep till end of polling interval
-            elapsed = (time.time() - start)
-            if (elapsed < self.polling_interval):
-                time.sleep(self.polling_interval - elapsed)
-            else:
-                LOG.debug(_("Loop iteration exceeded interval "
-                            "(%(polling_interval)s vs. %(elapsed)s)!"),
-                          {'polling_interval': self.polling_interval,
-                           'elapsed': elapsed})
 
     def daemon_loop(self):
-        self.rpc_loop()
+        self.udev_loop()
 
 
 def check_ovs_version(min_required_version, root_helper):
@@ -776,7 +786,7 @@ def check_ovs_version(min_required_version, root_helper):
                             'VXLAN tunnels with OVS, please ensure '
                             'the OVS version is %s or newer!'),
                           min_required_version)
-                sys.exti(1)
+                sys.exit(1)
             else:
                 LOG.warning(_('Cannot determine kernel Open vSwitch version, '
                               'please ensure your Open vSwitch kernel module '
