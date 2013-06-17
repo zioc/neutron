@@ -13,6 +13,7 @@
 # from the old mechanism
 ovs-vsctl: CommandFilter, ovs-vsctl, root
 ovs-ofctl: CommandFilter, ovs-ofctl, root
+ovsdb-client: CommandFilter, ovsdb-client, root
 xe: CommandFilter, xe, root
 
 # ip_lib

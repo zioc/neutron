@@ -23,8 +23,9 @@
 # @author: Kyle Mestery, Cisco Systems, Inc.
 
 import distutils.version as dist_version
+import os
+import shlex
 import sys
-import time
 
 import eventlet
 from oslo.config import cfg
@@ -169,6 +170,7 @@ class OVSQuantumAgent(sg_rpc.SecurityGroupAgentRpcCallbackMixin):
         self.local_vlan_map = {}
 
         self.polling_interval = polling_interval
+        self.vif_ports = {'current': set(), 'added': set(), 'removed': set()}
 
         if tunnel_type in constants.TUNNEL_NETWORK_TYPES:
             self.enable_tunneling = True
@@ -191,7 +193,7 @@ class OVSQuantumAgent(sg_rpc.SecurityGroupAgentRpcCallbackMixin):
             'start_flag': True}
         self.setup_rpc()
 
-        # Security group agent supprot
+        # Security group agent support
         self.sg_agent = OVSSecurityGroupAgent(self.context,
                                               self.plugin_rpc,
                                               root_helper)
@@ -204,8 +206,7 @@ class OVSQuantumAgent(sg_rpc.SecurityGroupAgentRpcCallbackMixin):
     def _report_state(self):
         try:
             # How many devices are likely used by a VM
-            ports = self.int_br.get_vif_port_set()
-            num_devices = len(ports)
+            num_devices = len(self.vif_ports['current'])
             self.agent_state.get('configurations')['devices'] = num_devices
             self.state_rpc.report_state(self.context,
                                         self.agent_state)
@@ -604,16 +605,6 @@ class OVSQuantumAgent(sg_rpc.SecurityGroupAgentRpcCallbackMixin):
             int_veth.link.set_up()
             phys_veth.link.set_up()
 
-    def update_ports(self, registered_ports):
-        ports = self.int_br.get_vif_port_set()
-        if ports == registered_ports:
-            return
-        added = ports - registered_ports
-        removed = registered_ports - ports
-        return {'current': ports,
-                'added': added,
-                'removed': removed}
-
     def treat_vif_port(self, vif_port, port_id, network_id, network_type,
                        physical_network, segmentation_id, admin_state_up):
         if vif_port:
@@ -626,7 +617,6 @@ class OVSQuantumAgent(sg_rpc.SecurityGroupAgentRpcCallbackMixin):
             LOG.debug(_("No VIF port for port %s defined on agent."), port_id)
 
     def treat_devices_added(self, devices):
-        resync = False
         self.sg_agent.prepare_devices_filter(devices)
         for device in devices:
             LOG.info(_("Port %s added"), device)
@@ -638,10 +628,11 @@ class OVSQuantumAgent(sg_rpc.SecurityGroupAgentRpcCallbackMixin):
                 LOG.debug(_("Unable to get port details for "
                             "%(device)s: %(e)s"),
                           {'device': device, 'e': e})
-                resync = True
                 continue
+            self.vif_ports['added'].remove(device)
             port = self.int_br.get_vif_port_by_id(details['device'])
             if 'port_id' in details:
+                self.vif_ports['current'].add(device)
                 LOG.info(_("Port %(device)s updated. Details: %(details)s"),
                          {'device': device, 'details': details})
                 self.treat_vif_port(port, details['port_id'],
@@ -654,10 +645,8 @@ class OVSQuantumAgent(sg_rpc.SecurityGroupAgentRpcCallbackMixin):
                 LOG.debug(_("Device %s not defined on plugin"), device)
                 if (port and int(port.ofport) != -1):
                     self.port_dead(port)
-        return resync
 
     def treat_devices_removed(self, devices):
-        resync = False
         self.sg_agent.remove_devices_filter(devices)
         for device in devices:
             LOG.info(_("Attachment %s removed"), device)
@@ -668,28 +657,25 @@ class OVSQuantumAgent(sg_rpc.SecurityGroupAgentRpcCallbackMixin):
             except Exception as e:
                 LOG.debug(_("port_removed failed for %(device)s: %(e)s"),
                           {'device': device, 'e': e})
-                resync = True
                 continue
+            self.vif_ports['removed'].remove(device)
             if details['exists']:
                 LOG.info(_("Port %s updated."), device)
                 # Nothing to do regarding local networking
             else:
                 LOG.debug(_("Device %s not defined on plugin"), device)
                 self.port_unbound(device)
-        return resync
 
-    def process_network_ports(self, port_info):
-        resync_a = False
-        resync_b = False
-        if 'added' in port_info:
-            resync_a = self.treat_devices_added(port_info['added'])
-        if 'removed' in port_info:
-            resync_b = self.treat_devices_removed(port_info['removed'])
-        # If one of the above opertaions fails => resync with plugin
-        return (resync_a | resync_b)
+    def process_network_ports(self):
+        self.treat_devices_added(self.vif_ports['added'].copy())
+        self.treat_devices_removed(self.vif_ports['removed'].copy())
+        # If all devices have been threaten, no need to resync with plugin
+        if self.process_port_loop and (
+                len(self.vif_ports['added']) +
+                len(self.vif_ports['removed'])) == 0:
+            self.process_port_loop.stop()
 
     def tunnel_sync(self):
-        resync = False
         try:
             details = self.plugin_rpc.tunnel_sync(self.context, self.local_ip)
             tunnels = details['tunnels']
@@ -702,53 +688,95 @@ class OVSQuantumAgent(sg_rpc.SecurityGroupAgentRpcCallbackMixin):
         except Exception as e:
             LOG.debug(_("Unable to sync tunnel IP %(local_ip)s: %(e)s"),
                       {'local_ip': self.local_ip, 'e': e})
-            resync = True
-        return resync
+            return
+        if self.tunnel_resync:
+            self.tunnel_resync.stop()
 
-    def rpc_loop(self):
-        sync = True
-        ports = set()
-        tunnel_sync = True
-
-        while True:
-            try:
-                start = time.time()
-                if sync:
-                    LOG.info(_("Agent out of sync with plugin!"))
-                    ports.clear()
-                    sync = False
-
-                # Notify the plugin of tunnel IP
-                if self.enable_tunneling and tunnel_sync:
-                    LOG.info(_("Agent tunnel out of sync with plugin!"))
-                    tunnel_sync = self.tunnel_sync()
-
-                port_info = self.update_ports(ports)
-
-                # notify plugin about port deltas
-                if port_info:
-                    LOG.debug(_("Agent loop has new devices!"))
-                    # If treat devices fails - must resync with plugin
-                    sync = self.process_network_ports(port_info)
-                    ports = port_info['current']
-
-            except Exception:
-                LOG.exception(_("Error in agent event loop"))
-                sync = True
-                tunnel_sync = True
-
-            # sleep till end of polling interval
-            elapsed = (time.time() - start)
-            if (elapsed < self.polling_interval):
-                time.sleep(self.polling_interval - elapsed)
-            else:
-                LOG.debug(_("Loop iteration exceeded interval "
-                            "(%(polling_interval)s vs. %(elapsed)s)!"),
-                          {'polling_interval': self.polling_interval,
-                           'elapsed': elapsed})
+    def treat_port_event(self, port_info):
+        port_id = None
+        if "iface-id" in port_info['external_ids']:
+            port_id = port_info['external_ids']['iface-id']
+        if "xs-vif-uuid" in port_info['external_ids']:
+            port_id = self.int_br.get_xapi_iface_id(port_info["xs-vif-uuid"])
+        if port_id:
+            if port_info['action'] in ('initial', 'insert'):
+                LOG.info(_('Port %(iface-id)s added to bridge'),
+                         {'iface-id': port_id})
+                self.vif_ports['added'].add(port_id)
+                if not self.process_port_loop._running:
+                    self.process_port_loop.start(self.polling_interval, 0)
+            elif port_info['action'] == 'delete':
+                LOG.info(_('Port %(iface-id)s removed from bridge'),
+                         {'iface-id': port_id})
+                self.vif_ports['removed'].add(port_id)
+                self.vif_ports['current'].remove(port_id)
+                if not self.process_port_loop._running:
+                    self.process_port_loop.start(self.polling_interval, 0)
 
     def daemon_loop(self):
-        self.rpc_loop()
+        if self.enable_tunneling:
+            #Start looping call to ensure sync tunnel endpoints
+            self.tunnel_resync = None
+            self.tunnel_resync = loopingcall.FixedIntervalLoopingCall(
+                self.tunnel_sync)
+            self.tunnel_resync.start(interval=self.polling_interval)
+
+        # Initialize looping call used to retrieve device details
+        self.process_port_loop = None
+        self.process_port_loop = loopingcall.FixedIntervalLoopingCall(
+            self.process_network_ports)
+
+        # It look like we can't use:
+        # event, error = utils.execute(cmd, root_helper=self.root_helper,
+        #                             return_stderr=True)
+        #
+        # because of: https://github.com/eventlet/eventlet/pull/24
+
+        cmd = ['ovsdb-client', '--format=csv', 'monitor', 'Interface',
+               'name,link_state,ofport,external_ids']
+        if self.root_helper:
+            cmd = shlex.split(self.root_helper) + cmd
+
+        try:
+            monitor = eventlet.green.subprocess.Popen(
+                cmd,
+                stdout=eventlet.green.subprocess.PIPE,
+                stderr=eventlet.green.subprocess.PIPE,
+                env=os.environ.copy())
+        except Exception as e:
+            LOG.error(_("Failed to execute subprocess: %(e)s, "
+                      "Agent terminated"), {'e': e})
+            sys.exit(1)
+
+        # To build a dict from ovsdb monitor output,
+        # headings are stored in columns_names
+        columns_names = list()
+        for line in monitor.stdout:
+            event = line.translate(None, "\"\r\n")
+            # ovsdb-monitor seems to sometimes output blank lines
+            if not event:
+                continue
+            if len(columns_names) == 0:
+                if event.find("row") == -1:
+                    LOG.error(_('Failed to monitor ovsdb: %(stdout)s'),
+                              {'stdout': event})
+                    break
+                else:
+                    columns_names = event.split(',')
+                    continue
+            # Assumes that external_ids is at the end of the line
+            row = event.split(',', len(columns_names) - 1)
+            port_info = dict(zip(columns_names, row))
+            port_info["external_ids"] = self.int_br.db_str_to_map(
+                port_info["external_ids"])
+            self.treat_port_event(port_info)
+
+        error = monitor.stderr.readline()
+        if error:
+            LOG.error(_('Failed to monitor ovsdb: %(stderr)s'),
+                      {'stderr': error.rstrip("\n\r")})
+
+        LOG.info(_("Agent terminated"))
 
 
 def check_ovs_version(min_required_version, root_helper):

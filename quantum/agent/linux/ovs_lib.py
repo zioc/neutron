@@ -211,6 +211,17 @@ class OVSBridge:
             ret[arr[0]] = arr[1].strip("\"")
         return ret
 
+    def db_csv_to_map(self, full_str):
+        list = full_str.translate(None, "\"\r\n").split(',')
+        ret = {}
+        for e in list:
+            if e.find("=") == -1:
+                ret[e] = None
+            else:
+                arr = e.split("=")
+                ret[arr[0]] = arr[1]
+        return ret
+
     def get_port_name_list(self):
         res = self.run_vsctl(["list-ports", self.br_name])
         if res:
