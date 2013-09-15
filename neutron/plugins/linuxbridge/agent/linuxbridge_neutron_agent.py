@@ -54,11 +54,7 @@ LOG = logging.getLogger(__name__)
 
 BRIDGE_NAME_PREFIX = "brq"
 TAP_INTERFACE_PREFIX = "tap"
-BRIDGE_FS = "/sys/devices/virtual/net/"
-BRIDGE_NAME_PLACEHOLDER = "bridge_name"
-BRIDGE_INTERFACES_FS = BRIDGE_FS + BRIDGE_NAME_PLACEHOLDER + "/brif/"
-DEVICE_NAME_PLACEHOLDER = "device_name"
-BRIDGE_PORT_FS_FOR_DEVICE = BRIDGE_FS + DEVICE_NAME_PLACEHOLDER + "/brport"
+NET_FS = "/sys/class/net/"
 VXLAN_INTERFACE_PREFIX = "vxlan-"
 
 
@@ -93,19 +89,10 @@ class LinuxBridgeManager:
 
     def device_exists(self, device):
         """Check if ethernet device exists."""
-        try:
-            utils.execute(['ip', 'link', 'show', 'dev', device],
-                          root_helper=self.root_helper)
-        except RuntimeError:
-            return False
-        return True
+        return os.path.exists('%s%s' % (NET_FS, device))
 
     def interface_exists_on_bridge(self, bridge, interface):
-        directory = '/sys/class/net/%s/brif' % bridge
-        for filename in os.listdir(directory):
-            if filename == interface:
-                return True
-        return False
+        return interface in self.get_interfaces_on_bridge(bridge)
 
     def get_bridge_name(self, network_id):
         if not network_id:
@@ -137,7 +124,7 @@ class LinuxBridgeManager:
 
     def get_all_neutron_bridges(self):
         neutron_bridge_list = []
-        bridge_list = os.listdir(BRIDGE_FS)
+        bridge_list = os.listdir(NET_FS)
         for bridge in bridge_list:
             if bridge.startswith(BRIDGE_NAME_PREFIX):
                 neutron_bridge_list.append(bridge)
@@ -145,41 +132,30 @@ class LinuxBridgeManager:
 
     def get_interfaces_on_bridge(self, bridge_name):
         if self.device_exists(bridge_name):
-            bridge_interface_path = BRIDGE_INTERFACES_FS.replace(
-                BRIDGE_NAME_PLACEHOLDER, bridge_name)
-            return os.listdir(bridge_interface_path)
+            bridge_dir = '%s%s/brif' % (NET_FS, bridge_name)
+            return os.listdir(bridge_dir)
 
     def get_tap_devices_count(self, bridge_name):
-            bridge_interface_path = BRIDGE_INTERFACES_FS.replace(
-                BRIDGE_NAME_PLACEHOLDER, bridge_name)
-            try:
-                if_list = os.listdir(bridge_interface_path)
-                return len([interface for interface in if_list if
-                            interface.startswith(TAP_INTERFACE_PREFIX)])
-            except OSError:
-                return 0
+        return len([interface for interface in
+                    self.get_interfaces_on_bridge(bridge_name) if
+                    interface.startswith(TAP_INTERFACE_PREFIX)])
 
     def get_interface_by_ip(self, ip):
         for device in self.ip.get_devices():
             if device.addr.list(to=ip):
                 return device.name
 
-    def get_bridge_for_tap_device(self, tap_device_name):
+    def get_bridge_for_device(self, device_name):
         bridges = self.get_all_neutron_bridges()
         for bridge in bridges:
-            interfaces = self.get_interfaces_on_bridge(bridge)
-            if tap_device_name in interfaces:
+            if self.interface_exists_on_bridge(bridge, device_name):
                 return bridge
 
-        return None
-
     def is_device_on_bridge(self, device_name):
-        if not device_name:
-            return False
+        if self.get_bridge_for_device(device_name):
+            return True
         else:
-            bridge_port_path = BRIDGE_PORT_FS_FOR_DEVICE.replace(
-                DEVICE_NAME_PLACEHOLDER, device_name)
-            return os.path.exists(bridge_port_path)
+            return False
 
     def ensure_vlan_bridge(self, network_id, physical_interface, vlan_id):
         """Create a vlan and bridge unless they already exist."""
@@ -322,8 +298,8 @@ class LinuxBridgeManager:
         if not self.interface_exists_on_bridge(bridge_name, interface):
             try:
                 # Check if the interface is not enslaved in another bridge
-                if self.is_device_on_bridge(interface):
-                    bridge = self.get_bridge_for_tap_device(interface)
+                bridge = self.get_bridge_for_device(interface)
+                if bridge:
                     utils.execute(['brctl', 'delif', bridge, interface],
                                   root_helper=self.root_helper)
 
@@ -385,7 +361,7 @@ class LinuxBridgeManager:
             return False
 
         # Check if device needs to be added to bridge
-        tap_device_in_bridge = self.get_bridge_for_tap_device(tap_device_name)
+        tap_device_in_bridge = self.get_bridge_for_device(tap_device_name)
         if not tap_device_in_bridge:
             data = {'tap_device_name': tap_device_name,
                     'bridge_name': bridge_name}
@@ -418,18 +394,18 @@ class LinuxBridgeManager:
             interfaces_on_bridge = self.get_interfaces_on_bridge(bridge_name)
             for interface in interfaces_on_bridge:
                 self.remove_interface(bridge_name, interface)
-                for physical_interface in self.interface_mappings.itervalues():
-                    if physical_interface == interface:
-                        # This is a flat network => return IP's from bridge to
-                        # interface
-                        ips, gateway = self.get_interface_details(bridge_name)
-                        self.update_interface_ip_details(interface,
-                                                         bridge_name,
-                                                         ips, gateway)
-                    elif interface.startswith(physical_interface):
-                        self.delete_vlan(interface)
-                    elif interface.startswith(VXLAN_INTERFACE_PREFIX):
-                        self.delete_vxlan(interface)
+                if interface in self.interface_mappings.itervalues():
+                    # This is a flat network => return IP's from bridge to
+                    # interface
+                    ips, gateway = self.get_interface_details(bridge_name)
+                    self.update_interface_ip_details(interface,
+                                                     bridge_name,
+                                                     ips, gateway)
+                elif [iface for iface in self.interface_mappings.itervalues()
+                      if interface.startswith(iface)]:
+                    self.delete_vlan(interface)
+                elif interface.startswith(VXLAN_INTERFACE_PREFIX):
+                    self.delete_vxlan(interface)
 
             LOG.debug(_("Deleting bridge %s"), bridge_name)
             if utils.execute(['ip', 'link', 'set', bridge_name, 'down'],

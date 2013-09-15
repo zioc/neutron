@@ -168,10 +168,15 @@ class TestLinuxBridgeManager(base.BaseTestCase):
             self.interface_mappings, self.root_helper)
 
     def test_device_exists(self):
-        with mock.patch.object(utils, 'execute') as execute_fn:
-            self.assertTrue(self.lbm.device_exists("eth0"))
-            execute_fn.side_effect = RuntimeError()
-            self.assertFalse(self.lbm.device_exists("eth0"))
+        with mock.patch.object(os.path, 'exists') as dir_exists_fn:
+            dir_exists_fn.return_value = True
+            self.assertTrue(
+                self.lbm.device_exists("eth0")
+            )
+            dir_exists_fn.return_value = False
+            self.assertFalse(
+                self.lbm.device_exists("eth1")
+            )
 
     def test_interface_exists_on_bridge(self):
         with mock.patch.object(os, 'listdir') as listdir_fn:
@@ -221,19 +226,19 @@ class TestLinuxBridgeManager(base.BaseTestCase):
 
     def test_get_interfaces_on_bridge(self):
         with contextlib.nested(
-            mock.patch.object(utils, 'execute'),
+            mock.patch.object(self.lbm, 'device_exists'),
             mock.patch.object(os, 'listdir')
-        ) as (exec_fn, listdir_fn):
+        ) as (exists_fn, listdir_fn):
+            exists_fn.return_value = True
             listdir_fn.return_value = ["qbr1"]
             self.assertEqual(self.lbm.get_interfaces_on_bridge("br0"),
                              ["qbr1"])
 
     def test_get_tap_devices_count(self):
-        with mock.patch.object(os, 'listdir') as listdir_fn:
-            listdir_fn.return_value = ['tap2101', 'eth0.100', 'vxlan-1000']
+        with mock.patch.object(self.lbm,
+                               'get_interfaces_on_bridge') as get_if_fn:
+            get_if_fn.return_value = ['tap2101', 'eth0.100', 'vxlan-1000']
             self.assertEqual(self.lbm.get_tap_devices_count('br0'), 1)
-            listdir_fn.side_effect = OSError()
-            self.assertEqual(self.lbm.get_tap_devices_count('br0'), 0)
 
     def test_get_interface_by_ip(self):
         with contextlib.nested(
@@ -247,26 +252,24 @@ class TestLinuxBridgeManager(base.BaseTestCase):
             self.assertEqual(self.lbm.get_interface_by_ip(LOCAL_IP),
                              'dev_name')
 
-    def test_get_bridge_for_tap_device(self):
+    def test_get_bridge_for_device(self):
         with contextlib.nested(
             mock.patch.object(self.lbm, "get_all_neutron_bridges"),
-            mock.patch.object(self.lbm, "get_interfaces_on_bridge")
-        ) as (get_all_qbr_fn, get_if_fn):
+            mock.patch.object(self.lbm, "interface_exists_on_bridge")
+        ) as (get_all_qbr_fn, if_on_br_fn):
             get_all_qbr_fn.return_value = ["br-int", "br-ex"]
-            get_if_fn.return_value = ["tap1", "tap2", "tap3"]
-            self.assertEqual(self.lbm.get_bridge_for_tap_device("tap1"),
+            if_on_br_fn.return_value = True
+            self.assertEqual(self.lbm.get_bridge_for_device("tap1"),
                              "br-int")
-            self.assertEqual(self.lbm.get_bridge_for_tap_device("tap4"),
+            if_on_br_fn.return_value = False
+            self.assertEqual(self.lbm.get_bridge_for_device("tap4"),
                              None)
 
     def test_is_device_on_bridge(self):
         self.assertTrue(not self.lbm.is_device_on_bridge(""))
-        with mock.patch.object(os.path, 'exists') as exists_fn:
-            exists_fn.return_value = True
+        with mock.patch.object(self.lbm, 'get_bridge_for_device') as get_br_fn:
+            get_br_fn.return_value = 'br0'
             self.assertTrue(self.lbm.is_device_on_bridge("tap1"))
-            exists_fn.assert_called_with(
-                "/sys/devices/virtual/net/tap1/brport"
-            )
 
     def test_get_interface_details(self):
         with contextlib.nested(
@@ -395,7 +398,7 @@ class TestLinuxBridgeManager(base.BaseTestCase):
             mock.patch.object(self.lbm, 'update_interface_ip_details'),
             mock.patch.object(self.lbm, 'interface_exists_on_bridge'),
             mock.patch.object(self.lbm, 'is_device_on_bridge'),
-            mock.patch.object(self.lbm, 'get_bridge_for_tap_device'),
+            mock.patch.object(self.lbm, 'get_bridge_for_device'),
         ) as (de_fn, exec_fn, upd_fn, ie_fn, if_br_fn, get_if_br_fn):
             de_fn.return_value = False
             exec_fn.return_value = False
@@ -466,7 +469,7 @@ class TestLinuxBridgeManager(base.BaseTestCase):
             with contextlib.nested(
                 mock.patch.object(self.lbm, "ensure_local_bridge"),
                 mock.patch.object(utils, "execute"),
-                mock.patch.object(self.lbm, "get_bridge_for_tap_device")
+                mock.patch.object(self.lbm, "get_bridge_for_device")
             ) as (en_fn, exec_fn, get_br):
                 exec_fn.return_value = False
                 get_br.return_value = True
